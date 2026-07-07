@@ -23,10 +23,33 @@ try {
         nombre TEXT NOT NULL,
         carnet TEXT UNIQUE NOT NULL,
         rol TEXT NOT NULL, -- 'Analista' o 'Asociado'
+        password_hash TEXT NOT NULL DEFAULT '',
+        activo INTEGER DEFAULT 1, -- Eliminación lógica
+        fecha_creacion TEXT DEFAULT CURRENT_TIMESTAMP
+    )");
+
+    // Asegurar columna de password_hash en esquemas existentes
+    $cols = $db->query("PRAGMA table_info(usuarios)")->fetchAll();
+    $hasPasswordHash = false;
+    foreach ($cols as $col) {
+        if ($col['name'] === 'password_hash') {
+            $hasPasswordHash = true;
+            break;
+        }
+    }
+    if (!$hasPasswordHash) {
+        $db->exec("ALTER TABLE usuarios ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''");
+    }
+
+    // 1.b Tabla de Asociados / Clientes (Fase 2)
+    $db->exec("CREATE TABLE IF NOT EXISTS asociados (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        usuario_id INTEGER UNIQUE NOT NULL,
         ingresos_mensuales REAL DEFAULT 0.0,
         gastos_mensuales REAL DEFAULT 0.0,
-        score_crediticio INTEGER DEFAULT 700, -- Historial crediticio simulado
-        activo INTEGER DEFAULT 1 -- Eliminación lógica
+        score_crediticio INTEGER DEFAULT 700,
+        activo INTEGER DEFAULT 1,
+        FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
     )");
 
     // 2. Tabla de Solicitudes (Fase 3, 4)
@@ -72,6 +95,7 @@ try {
     $db->exec("CREATE TABLE IF NOT EXISTS facturas_dte (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pago_id INTEGER NOT NULL,
+        numero_dte TEXT,
         sello_recepcion TEXT UNIQUE NOT NULL,
         tipo_documento TEXT DEFAULT 'Comprobante de Crédito Electrónico',
         monto_afecto REAL NOT NULL,
@@ -80,6 +104,25 @@ try {
         fecha_emision TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (pago_id) REFERENCES pagos(id)
     )");
+
+    $dteCols = $db->query("PRAGMA table_info(facturas_dte)")->fetchAll();
+    $hasNumeroDTE = false;
+    foreach ($dteCols as $col) {
+        if ($col['name'] === 'numero_dte') {
+            $hasNumeroDTE = true;
+            break;
+        }
+    }
+    if (!$hasNumeroDTE) {
+        $db->exec("ALTER TABLE facturas_dte ADD COLUMN numero_dte TEXT DEFAULT ''");
+    }
+
+    $rows = $db->query("SELECT id FROM facturas_dte WHERE IFNULL(numero_dte, '') = '' ORDER BY id")->fetchAll();
+    foreach ($rows as $index => $row) {
+        $numeroDTE = sprintf('DTE-%02d', $index + 1);
+        $update = $db->prepare("UPDATE facturas_dte SET numero_dte = ? WHERE id = ?");
+        $update->execute([$numeroDTE, $row['id']]);
+    }
 
     // 6. Tabla de Notificaciones Internas (Fase 4)
     $db->exec("CREATE TABLE IF NOT EXISTS notificaciones (
@@ -101,17 +144,79 @@ try {
 
     // Semilla de datos si está vacío
     $checkVacido = $db->query("SELECT COUNT(*) as total FROM usuarios")->fetch();
+    $seedStmt = $db->prepare("INSERT INTO usuarios (nombre, carnet, rol, password_hash, activo) VALUES (?, ?, ?, ?, 1)");
+    $assocStmt = $db->prepare("INSERT INTO asociados (usuario_id, ingresos_mensuales, gastos_mensuales, score_crediticio, activo) VALUES (?, ?, ?, ?, 1)");
+
     if ($checkVacido['total'] == 0) {
-        $db->exec("INSERT INTO usuarios (nombre, carnet, rol, ingresos_mensuales, gastos_mensuales, score_crediticio, activo) VALUES 
-            ('Héctor Ernesto Argueta Constanza', '00012424', 'Analista', 2500.00, 800.00, 780, 1),
-            ('Leonel Alexander Cañas Rodríguez', '00145424', 'Analista', 2200.00, 700.00, 750, 1),
-            ('Asociado Ejemplo de Pruebas', '00001111', 'Asociado', 1200.00, 400.00, 650, 1)
-        ");
+        $seedStmt->execute(['Héctor Ernesto Argueta Constanza', '00012424', 'Analista', password_hash('Analista2026!', PASSWORD_DEFAULT)]);
+        $seedStmt->execute(['Leonel Alexander Cañas Rodríguez', '00145424', 'Analista', password_hash('Analista2026!', PASSWORD_DEFAULT)]);
+        $seedStmt->execute(['Asociado Ejemplo de Pruebas', '00001111', 'Asociado', password_hash('Asociado2026!', PASSWORD_DEFAULT)]);
+        $asociadoId = $db->lastInsertId();
+        $assocStmt->execute([$asociadoId, 1200.00, 400.00, 650]);
     }
+
+    // Asegurar cuentas base y hashes de contraseña predeterminados cuando la BD ya exista
+    $defaultAccounts = [
+        ['Héctor Ernesto Argueta Constanza', '00012424', 'Analista', 'Analista2026!'],
+        ['Leonel Alexander Cañas Rodríguez', '00145424', 'Analista', 'Analista2026!'],
+        ['Asociado Ejemplo de Pruebas', '00001111', 'Asociado', 'Asociado2026!'],
+    ];
+    foreach ($defaultAccounts as $acc) {
+        $checkUser = $db->prepare("SELECT id, password_hash, rol FROM usuarios WHERE carnet = ?");
+        $checkUser->execute([$acc[1]]);
+        $existing = $checkUser->fetch();
+
+        if ($existing) {
+            if (empty($existing['password_hash'])) {
+                $updateHash = $db->prepare("UPDATE usuarios SET password_hash = ?, activo = 1 WHERE id = ?");
+                $updateHash->execute([password_hash($acc[3], PASSWORD_DEFAULT), $existing['id']]);
+            }
+            if ($existing['rol'] === 'Asociado') {
+                $assocCheck = $db->prepare("SELECT id FROM asociados WHERE usuario_id = ?");
+                $assocCheck->execute([$existing['id']]);
+                if (!$assocCheck->fetch()) {
+                    $assocStmt->execute([$existing['id'], 0.0, 0.0, 700]);
+                }
+            }
+        } else {
+            $seedStmt->execute([$acc[0], $acc[1], $acc[2], password_hash($acc[3], PASSWORD_DEFAULT)]);
+            if ($acc[2] === 'Asociado') {
+                $assocStmt->execute([$db->lastInsertId(), 0.0, 0.0, 700]);
+            }
+        }
+    }
+
+    // Asegurar que todos los asociados existentes tengan un registro en la tabla asociada
+    $db->exec("INSERT OR IGNORE INTO asociados (usuario_id, ingresos_mensuales, gastos_mensuales, score_crediticio, activo) SELECT u.id, 0.0, 0.0, 700, 1 FROM usuarios u LEFT JOIN asociados a ON a.usuario_id = u.id WHERE u.rol = 'Asociado' AND a.id IS NULL");
 
 } catch (PDOException $e) {
     die("Error crítico de inicialización de Base de Datos: " . $e->getMessage());
 }
+
+if (isset($_GET['download_dte'])) {
+    $dteId = intval($_GET['download_dte']);
+    $stmtDTE = $db->prepare("SELECT d.*, u.nombre as cliente, u.carnet, p.prestamo_id as prestamo FROM facturas_dte d JOIN pagos p ON d.pago_id = p.id JOIN prestamos pr ON p.prestamo_id = pr.id JOIN solicitudes s ON pr.solicitud_id = s.id JOIN usuarios u ON s.usuario_id = u.id WHERE d.id = ?");
+    $stmtDTE->execute([$dteId]);
+    $downloadDTE = $stmtDTE->fetch();
+    if ($downloadDTE) {
+        $filename = $downloadDTE['numero_dte'] ?: 'DTE-000';
+        $subtotal = $downloadDTE['monto_afecto'];
+        $iva = $downloadDTE['iva'];
+        $total = $subtotal + $iva;
+        $emisorNombre = 'COPERATIVA UCA S.A. DE C.V.';
+        $emisorDireccion = 'Antiguo Cuscatlan, La Libertad, El Salvador';
+        $emisorContacto = 'Tel: +503 2222-3333 | copeuca@uca.com';
+        $receptorNombre = htmlspecialchars($downloadDTE['cliente']);
+        $receptorCarnet = htmlspecialchars($downloadDTE['carnet']);
+
+        header('Content-Type: text/html; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $filename . '.html"');
+        echo '<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>' . htmlspecialchars($filename) . '</title><style>body{margin:0;padding:0;background:#f3f4f6;color:#111827;font-family:Arial,Helvetica,sans-serif;} .page{width:1200px;margin:0 auto;padding:40px;background:#fff;box-shadow:0 0 20px rgba(15,23,42,.08);} .header{display:flex;justify-content:space-between;align-items:flex-start;padding-bottom:24px;border-bottom:2px solid #e2e8f0;} .brand{max-width:52%;} .brand h1{margin:0;font-size:32px;letter-spacing:.1em;color:#0f172a;} .brand p{margin:4px 0;color:#475569;font-size:14px;} .doc-info{background:#0f172a;color:#fff;padding:18px 22px;border-radius:18px;text-align:right;} .doc-info strong{display:block;font-size:13px;color:#94a3b8;} .doc-info span{display:block;font-size:22px;font-weight:700;margin-top:6px;} .columns{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:28px;} .panel{background:#f8fafc;padding:24px;border:1px solid #e2e8f0;border-radius:18px;} .panel h2{margin:0 0 14px;font-size:16px;color:#0f172a;} .panel p{margin:6px 0;color:#334155;font-size:14px;line-height:1.5;} .table-wrap{overflow-x:auto;margin-top:28px;} table{width:100%;border-collapse:collapse;font-size:14px;} th,td{padding:14px 12px;border:1px solid #e2e8f0;text-align:left;} th{background:#0f172a;color:#fff;font-weight:600;} .text-right{text-align:right;} .totals{margin-top:18px;display:grid;grid-template-columns:1fr auto;gap:8px;}.totals div{padding:10px 14px;background:#f8fafc;border-radius:14px;} .totals div span{display:block;color:#475569;font-size:13px;} .totals strong{display:block;font-size:18px;color:#0f172a;margin-top:4px;} .footer{margin-top:36px;font-size:13px;color:#475569;} .small{font-size:12px;color:#64748b;}</style></head><body><div class="page"><div class="header"><div class="brand"><h1>COPERATIVA UCA</h1><p>Documento Tributario Electrónico</p><p>Modelo Facturación previa</p><p>' . $emisorDireccion . '</p><p>' . $emisorContacto . '</p></div><div class="doc-info"><strong>FACTURA</strong><span>' . htmlspecialchars($filename) . '</span><strong>Fecha emisión</strong><span>' . htmlspecialchars($downloadDTE['fecha_emision']) . '</span></div></div><div class="columns"><div class="panel"><h2>EMISOR</h2><p><strong>' . $emisorNombre . '</strong></p><p>NIT: 0619-010219-101-8</p><p>Nombre o razón social: ' . $emisorNombre . '</p><p>Actividad económica: Venta y distribución de lubricantes y repuestos</p></div><div class="panel"><h2>RECEPTOR</h2><p><strong>' . $receptorNombre . '</strong></p><p>Carnet: ' . $receptorCarnet . '</p><p>Tipo de documento: ' . htmlspecialchars($downloadDTE['tipo_documento']) . '</p><p>Estado DTE: ' . htmlspecialchars($downloadDTE['estado_dte']) . '</p><p>Sello: ' . htmlspecialchars($downloadDTE['sello_recepcion']) . '</p></div></div><div class="table-wrap"><table><thead><tr><th>No.</th><th>Cantidad</th><th>Unidad</th><th>Código</th><th>Descripción</th><th class="text-right">Precio Unitario</th><th class="text-right">Total</th></tr></thead><tbody><tr><td>1</td><td>1.00</td><td>Servicio</td><td>PR-001</td><td>Pago de crédito y emisión de documento tributario</td><td class="text-right">$' . number_format($subtotal, 2) . '</td><td class="text-right">$' . number_format($subtotal, 2) . '</td></tr></tbody></table></div><div class="totals"><div><span>Monto afecto</span><strong>$' . number_format($subtotal, 2) . '</strong></div><div><span>IVA 13%</span><strong>$' . number_format($iva, 2) . '</strong></div><div><span>Total</span><strong>$' . number_format($total, 2) . '</strong></div></div><div class="footer"><p class="small">Este documento corresponde a una factura electrónica generada por el sistema. La información mostrada en este comprobante se basa en el pago registrado y puede ser verificada en el historial de DTE.</p></div></div></body></html>';
+        exit();
+    }
+}
+actualizarPrestamosMora($db);
+$csrf_token = generar_csrf_token();
 
 // ==========================================
 // FUNCIONES AUXILIARES DE AUDITORÍA Y CÁLCULO
@@ -147,6 +252,46 @@ function calcularAmortizacionFrancesa($monto, $meses, $tasaAnual) {
     return $tabla;
 }
 
+function escape($value) {
+    return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+}
+
+function generar_csrf_token() {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verificar_csrf_token($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+function obtenerAsociado($db, $usuarioId) {
+    $stmt = $db->prepare("SELECT * FROM asociados WHERE usuario_id = ? AND activo = 1");
+    $stmt->execute([$usuarioId]);
+    return $stmt->fetch();
+}
+
+function actualizarPrestamosMora($db) {
+    $stmt = $db->query("SELECT p.id, p.saldo_actual, p.estado, p.fecha_inicio, MAX(pa.fecha_pago) as ultima_fecha_pago FROM prestamos p LEFT JOIN pagos pa ON pa.prestamo_id = p.id GROUP BY p.id");
+    $prestamos = $stmt->fetchAll();
+    foreach ($prestamos as $prestamo) {
+        if ($prestamo['estado'] === 'Cancelado' || floatval($prestamo['saldo_actual']) <= 0) {
+            continue;
+        }
+        $referencia = $prestamo['ultima_fecha_pago'] ?: $prestamo['fecha_inicio'];
+        $fechaReferencia = new DateTime($referencia);
+        $ahora = new DateTime();
+        $diferencia = $ahora->diff($fechaReferencia)->days;
+        if ($diferencia > 35 && $prestamo['estado'] !== 'Mora') {
+            $update = $db->prepare("UPDATE prestamos SET estado = 'Mora' WHERE id = ?");
+            $update->execute([$prestamo['id']]);
+            registrarBitacora($db, 'Sistema', 'Mora Automática', 'Préstamo #' . $prestamo['id'] . ' marcado como Mora automáticamente.');
+        }
+    }
+}
+
 // ==========================================
 // CONTROLADOR DE ACCIONES / PETICIONES POST
 // ==========================================
@@ -154,24 +299,28 @@ $mensaje = ''; $tipo_mensaje = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $operacion = $_POST['operacion'] ?? '';
+    if (!verificar_csrf_token($_POST['csrf_token'] ?? '')) {
+        throw new Exception('Token de seguridad inválido. Refresca la página e inténtalo de nuevo.');
+    }
     
     try {
-        // --- AUTENTICACIÓN DIRECTA (Fase 1) ---
+        // --- AUTENTICACIÓN CON CONTRASEÑA (Fase 1) ---
         if ($operacion === 'login') {
             $carnet = trim($_POST['carnet']);
+            $password = $_POST['password'] ?? '';
             $stmt = $db->prepare("SELECT * FROM usuarios WHERE carnet = ? AND activo = 1");
             $stmt->execute([$carnet]);
             $user = $stmt->fetch();
             
-            if ($user) {
+            if ($user && !empty($user['password_hash']) && password_verify($password, $user['password_hash'])) {
                 $_SESSION['user_id'] = $user['id'];
                 $_SESSION['nombre'] = $user['nombre'];
                 $_SESSION['carnet'] = $user['carnet'];
                 $_SESSION['rol'] = $user['rol'];
-                registrarBitacora($db, $user['nombre'], "Login Exitoso", "Acceso directo verificado.");
+                registrarBitacora($db, $user['nombre'], "Login Exitoso", "Autenticación con contraseña verificada.");
                 header("Location: index.php"); exit();
             } else {
-                $mensaje = "Credenciales o carnet inválidos."; $tipo_mensaje = "error";
+                $mensaje = "Credenciales inválidas. Revisa carnet y contraseña."; $tipo_mensaje = "error";
             }
         }
         
@@ -179,9 +328,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($operacion === 'autoregistro') {
             $nombre = trim($_POST['nombre']);
             $carnet = trim($_POST['carnet']);
+            $password = $_POST['password'] ?? '';
             $ingresos = floatval($_POST['ingresos']);
             $gastos = floatval($_POST['gastos']);
             $score_inicial = rand(600, 750); // Buró simulado aleatorio para nuevos ingresos
+
+            if (empty($password) || strlen($password) < 6) {
+                throw new Exception('La contraseña debe tener al menos 6 caracteres.');
+            }
 
             // Verificar duplicados
             $chk = $db->prepare("SELECT COUNT(*) as total FROM usuarios WHERE carnet = ?");
@@ -190,11 +344,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new Exception("El número de carnet ya se encuentra registrado en el sistema.");
             }
 
-            $stmt = $db->prepare("INSERT INTO usuarios (nombre, carnet, rol, ingresos_mensuales, gastos_mensuales, score_crediticio, activo) VALUES (?, ?, 'Asociado', ?, ?, ?, 1)");
-            $stmt->execute([$nombre, $carnet, $ingresos, $gastos, $score_inicial]);
+            $hash = password_hash($password, PASSWORD_DEFAULT);
+            $stmt = $db->prepare("INSERT INTO usuarios (nombre, carnet, rol, password_hash, activo) VALUES (?, ?, 'Asociado', ?, 1)");
+            $stmt->execute([$nombre, $carnet, $hash]);
+            $usuarioId = $db->lastInsertId();
+            $assocStmt = $db->prepare("INSERT INTO asociados (usuario_id, ingresos_mensuales, gastos_mensuales, score_crediticio, activo) VALUES (?, ?, ?, ?, 1)");
+            $assocStmt->execute([$usuarioId, $ingresos, $gastos, $score_inicial]);
             
             registrarBitacora($db, $nombre, "Auto-registro exitoso", "Cuenta de Asociado creada autónomamente vía portal.");
-            $mensaje = "¡Cuenta creada con éxito! Ya puedes iniciar sesión con tu carnet."; $tipo_mensaje = "success";
+            $mensaje = "¡Cuenta creada con éxito! Ya puedes iniciar sesión con tu carnet y contraseña."; $tipo_mensaje = "success";
         }
         
         // --- CONTROL DE SEGURIDAD SESIÓN AUTENTICADA ---
@@ -206,13 +364,55 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 case 'guardar_usuario':
                     if ($_SESSION['rol'] !== 'Analista') throw new Exception("Privilegios insuficientes.");
                     $id = $_POST['id'] ?? '';
+                    $nombre = trim($_POST['nombre']);
+                    $carnet = trim($_POST['carnet']);
+                    $rol = $_POST['rol'];
+                    $password = $_POST['password'] ?? '';
+                    $ingresos = floatval($_POST['ingresos'] ?? 0);
+                    $gastos = floatval($_POST['gastos'] ?? 0);
+                    $score = intval($_POST['score'] ?? 700);
+
                     if (empty($id)) {
-                        $stmt = $db->prepare("INSERT INTO usuarios (nombre, carnet, rol, ingresos_mensuales, gastos_mensuales, score_crediticio) VALUES (?, ?, ?, ?, ?, ?)");
-                        $stmt->execute([$_POST['nombre'], $_POST['carnet'], $_POST['rol'], $_POST['ingresos'], $_POST['gastos'], $_POST['score']]);
-                        registrarBitacora($db, $operador, "Crear Usuario", "Analista registró a: " . $_POST['nombre']);
+                        if (empty($password) || strlen($password) < 6) {
+                            throw new Exception('Para nuevos usuarios, la contraseña debe tener al menos 6 caracteres.');
+                        }
+                        $hash = password_hash($password, PASSWORD_DEFAULT);
+                        $stmt = $db->prepare("INSERT INTO usuarios (nombre, carnet, rol, password_hash, activo) VALUES (?, ?, ?, ?, 1)");
+                        $stmt->execute([$nombre, $carnet, $rol, $hash]);
+                        $nuevoId = $db->lastInsertId();
+
+                        if ($rol === 'Asociado') {
+                            $assoc = $db->prepare("INSERT INTO asociados (usuario_id, ingresos_mensuales, gastos_mensuales, score_crediticio, activo) VALUES (?, ?, ?, ?, 1)");
+                            $assoc->execute([$nuevoId, $ingresos, $gastos, $score]);
+                        }
+
+                        registrarBitacora($db, $operador, "Crear Usuario", "Analista registró a: " . $nombre);
                     } else {
-                        $stmt = $db->prepare("UPDATE usuarios SET nombre=?, carnet=?, rol=?, ingresos_mensuales=?, gastos_mensuales=?, score_crediticio=? WHERE id=?");
-                        $stmt->execute([$_POST['nombre'], $_POST['carnet'], $_POST['rol'], $_POST['ingresos'], $_POST['gastos'], $_POST['score'], $id]);
+                        $params = [$nombre, $carnet, $rol];
+                        $sqlParts = ["nombre=?, carnet=?, rol=?"];
+                        if (!empty($password)) {
+                            $sqlParts[] = "password_hash=?";
+                            $params[] = password_hash($password, PASSWORD_DEFAULT);
+                        }
+                        $params[] = $id;
+                        $stmt = $db->prepare("UPDATE usuarios SET " . implode(', ', $sqlParts) . " WHERE id = ?");
+                        $stmt->execute($params);
+
+                        if ($rol === 'Asociado') {
+                            $assoc = $db->prepare("SELECT id FROM asociados WHERE usuario_id = ?");
+                            $assoc->execute([$id]);
+                            if ($assoc->fetch()) {
+                                $updateAssoc = $db->prepare("UPDATE asociados SET ingresos_mensuales = ?, gastos_mensuales = ?, score_crediticio = ?, activo = 1 WHERE usuario_id = ?");
+                                $updateAssoc->execute([$ingresos, $gastos, $score, $id]);
+                            } else {
+                                $insertAssoc = $db->prepare("INSERT INTO asociados (usuario_id, ingresos_mensuales, gastos_mensuales, score_crediticio, activo) VALUES (?, ?, ?, ?, 1)");
+                                $insertAssoc->execute([$id, $ingresos, $gastos, $score]);
+                            }
+                        } else {
+                            $deactivate = $db->prepare("UPDATE asociados SET activo = 0 WHERE usuario_id = ?");
+                            $deactivate->execute([$id]);
+                        }
+
                         registrarBitacora($db, $operador, "Modificar Usuario", "ID modificado: " . $id);
                     }
                     $mensaje = "Registro de usuario procesado con éxito."; $tipo_mensaje = "success";
@@ -232,9 +432,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $plazo = intval($_POST['plazo']);
                     $u_id = $_SESSION['user_id'];
                     
-                    $stmtU = $db->prepare("SELECT * FROM usuarios WHERE id = ?");
-                    $stmtU->execute([$u_id]);
-                    $asoc = $stmtU->fetch();
+                    $asoc = obtenerAsociado($db, $u_id);
+                    if (!$asoc) {
+                        throw new Exception('Perfil de asociado no encontrado.');
+                    }
 
                     $chkMora = $db->prepare("SELECT COUNT(*) as en_mora FROM prestamos p JOIN solicitudes s ON p.solicitud_id = s.id WHERE s.usuario_id = ? AND p.estado = 'Mora'");
                     $chkMora->execute([$u_id]);
@@ -316,11 +517,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $upP = $db->prepare("UPDATE prestamos SET saldo_actual = ?, estado = ? WHERE id = ?");
                     $upP->execute([$nuevoSaldo, $nuevo_estado_p, $p_id]);
 
-                    $selloDTE = "DTE-11-CCFE-" . date('YmdHis') . "-" . str_pad($pago_id_generado, 6, '0', STR_PAD_LEFT);
+                    $numeroDTE = sprintf('DTE-%02d', $db->query("SELECT COUNT(*) FROM facturas_dte")->fetchColumn() + 1);
+                    $selloDTE = $numeroDTE . "-CCFE-" . date('YmdHis') . "-" . str_pad($pago_id_generado, 6, '0', STR_PAD_LEFT);
                     $ivaSimulado = round($interesMensual * 0.13, 2); 
 
-                    $insDte = $db->prepare("INSERT INTO facturas_dte (pago_id, sello_recepcion, monto_afecto, iva) VALUES (?, ?, ?, ?)");
-                    $insDte->execute([$pago_id_generado, $selloDTE, $monto_abonado, $ivaSimulado]);
+                    $insDte = $db->prepare("INSERT INTO facturas_dte (pago_id, numero_dte, sello_recepcion, monto_afecto, iva) VALUES (?, ?, ?, ?, ?)");
+                    $insDte->execute([$pago_id_generado, $numeroDTE, $selloDTE, $monto_abonado, $ivaSimulado]);
 
                     $db->commit();
                     registrarBitacora($db, $operador, "Pago y DTE", "Abono aplicado al préstamo #$p_id.");
@@ -395,6 +597,7 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
 
                 <form id="form-login" method="POST" class="space-y-6">
                     <input type="hidden" name="operacion" value="login">
+                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                     <div>
                         <label class="block text-xs font-bold uppercase tracking-wider text-slate-400">Carnet Identificador</label>
                         <div class="mt-1 relative">
@@ -404,6 +607,10 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                             <input type="text" name="carnet" required placeholder="Ej. 00012424" class="block w-full pl-10 pr-3 py-3 bg-slate-950/60 border border-slate-800 rounded-xl text-white font-mono placeholder-slate-600 focus:outline-none focus:border-cyan-500 text-sm">
                         </div>
                     </div>
+                    <div>
+                        <label class="block text-xs font-bold uppercase tracking-wider text-slate-400">Contraseña</label>
+                        <input type="password" name="password" required placeholder="Ingresa tu contraseña" class="block w-full py-3 px-3 bg-slate-950/60 border border-slate-800 rounded-xl text-white font-mono placeholder-slate-600 focus:outline-none focus:border-cyan-500 text-sm">
+                    </div>
                     <button type="submit" class="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-md text-sm font-bold text-slate-950 bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 focus:outline-none transition-all">
                         Validar Firma y Entrar
                     </button>
@@ -411,6 +618,7 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
 
                 <form id="form-registro" method="POST" class="space-y-4 hidden text-xs">
                     <input type="hidden" name="operacion" value="autoregistro">
+                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                     <div>
                         <label class="block font-bold text-slate-400 mb-1">Nombre Completo</label>
                         <input type="text" name="nombre" required placeholder="Ej. Juan Pérez" class="w-full p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl text-white focus:outline-none focus:border-cyan-500 text-sm">
@@ -418,6 +626,10 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                     <div>
                         <label class="block font-bold text-slate-400 mb-1">Carnet Institucional Único</label>
                         <input type="text" name="carnet" required placeholder="Ej. 00224426" class="w-full p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl text-white font-mono focus:outline-none focus:border-cyan-500 text-sm">
+                    </div>
+                    <div>
+                        <label class="block font-bold text-slate-400 mb-1">Contraseña</label>
+                        <input type="password" name="password" required placeholder="Mínimo 6 caracteres" class="w-full p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl text-white font-mono focus:outline-none focus:border-cyan-500 text-sm">
                     </div>
                     <div class="grid grid-cols-2 gap-3">
                         <div>
@@ -604,17 +816,23 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
 
                 <?php elseif ($sec === 'usuarios' && $rol_sesion === 'Analista'): ?>
                     <?php
-                    $buscar = $_GET['q'] ?? '';
-                    $query_u = "SELECT * FROM usuarios WHERE activo = 1";
-                    if (!empty($buscar)) {
-                        $query_u .= " AND (nombre LIKE '%$buscar%' OR carnet LIKE '%$buscar%')";
+                    $buscar = trim($_GET['q'] ?? '');
+                    $query_u = "SELECT u.*, a.ingresos_mensuales, a.gastos_mensuales, a.score_crediticio FROM usuarios u LEFT JOIN asociados a ON a.usuario_id = u.id WHERE u.activo = 1";
+                    $params = [];
+                    if ($buscar !== '') {
+                        $query_u .= " AND (u.nombre LIKE ? OR u.carnet LIKE ? )";
+                        $params[] = "%$buscar%";
+                        $params[] = "%$buscar%";
                     }
-                    $lista_u = $db->query($query_u)->fetchAll();
+                    $stmtU = $db->prepare($query_u);
+                    $stmtU->execute($params);
+                    $lista_u = $stmtU->fetchAll();
                     
                     $edit_id = $_GET['edit'] ?? '';
                     $u_edit = ['id'=>'','nombre'=>'','carnet'=>'','rol'=>'Asociado','ingresos_mensuales'=>0,'gastos_mensuales'=>0,'score_crediticio'=>700];
                     if (!empty($edit_id)) {
-                        $st = $db->prepare("SELECT * FROM usuarios WHERE id = ?"); $st->execute([$edit_id]);
+                        $st = $db->prepare("SELECT u.*, a.ingresos_mensuales, a.gastos_mensuales, a.score_crediticio FROM usuarios u LEFT JOIN asociados a ON a.usuario_id = u.id WHERE u.id = ?");
+                        $st->execute([$edit_id]);
                         $u_edit = $st->fetch() ?: $u_edit;
                     }
                     ?>
@@ -623,10 +841,12 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                             <h3 class="text-sm font-bold text-slate-800 mb-4"><?= !empty($u_edit['id']) ? 'Modificar Registro':'Inyectar Nuevo Registro' ?></h3>
                             <form method="POST" class="space-y-4 text-xs">
                                 <input type="hidden" name="operacion" value="guardar_usuario">
+                                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                                 <input type="hidden" name="id" value="<?= $u_edit['id'] ?>">
                                 <div><label class="block text-slate-500 font-medium mb-1">Nombre Completo</label><input type="text" name="nombre" required value="<?= htmlspecialchars($u_edit['nombre']) ?>" class="w-full p-2.5 bg-slate-50 border rounded-xl"></div>
                                 <div><label class="block text-slate-500 font-medium mb-1">Carnet Identificador</label><input type="text" name="carnet" required value="<?= htmlspecialchars($u_edit['carnet']) ?>" class="w-full p-2.5 bg-slate-50 border rounded-xl font-mono"></div>
                                 <div><label class="block text-slate-500 font-medium mb-1">Rol Operativo</label><select name="rol" class="w-full p-2.5 bg-slate-50 border rounded-xl"><option value="Asociado" <?= $u_edit['rol']==='Asociado'?'selected':'' ?>>Asociado (Cliente)</option><option value="Analista" <?= $u_edit['rol']==='Analista'?'selected':'' ?>>Analista (Interno)</option></select></div>
+                        <div><label class="block text-slate-500 font-medium mb-1">Contraseña</label><input type="password" name="password" placeholder="Dejar en blanco para mantener" class="w-full p-2.5 bg-slate-50 border rounded-xl"></div>
                                 <div><label class="block text-slate-500 font-medium mb-1">Ingresos Mensuales ($)</label><input type="number" name="ingresos" step="0.01" value="<?= $u_edit['ingresos_mensuales'] ?>" class="w-full p-2.5 bg-slate-50 border rounded-xl font-mono"></div>
                                 <div><label class="block text-slate-500 font-medium mb-1">Gastos Mensuales ($)</label><input type="number" name="gastos" step="0.01" value="<?= $u_edit['gastos_mensuales'] ?>" class="w-full p-2.5 bg-slate-50 border rounded-xl font-mono"></div>
                                 <div><label class="block text-slate-500 font-medium mb-1">Score Buró</label><input type="number" name="score" value="<?= $u_edit['score_crediticio'] ?>" class="w-full p-2.5 bg-slate-50 border rounded-xl font-mono"></div>
@@ -659,6 +879,7 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                                                     <a href="?sec=usuarios&edit=<?= $u['id'] ?>" class="p-1.5 bg-slate-100 hover:bg-slate-200 rounded text-slate-600"><i data-lucide="edit" class="w-3.5 h-3.5"></i></a>
                                                     <form method="POST" onsubmit="return confirm('¿Aplicar baja lógica?');" class="inline">
                                                         <input type="hidden" name="operacion" value="eliminar_logico">
+                                                        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                                                         <input type="hidden" name="id" value="<?= $u['id'] ?>">
                                                         <button class="p-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded"><i data-lucide="trash" class="w-3.5 h-3.5"></i></button>
                                                     </form>
@@ -673,7 +894,7 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
 
                 <?php elseif ($sec === 'comite' && $rol_sesion === 'Analista'): ?>
                     <?php
-                    $sols = $db->query("SELECT s.*, u.nombre as cliente, u.ingresos_mensuales, u.gastos_mensuales, u.score_crediticio FROM solicitudes s JOIN usuarios u ON s.usuario_id = u.id ORDER BY s.id DESC")->fetchAll();
+                    $sols = $db->query("SELECT s.*, u.nombre as cliente, a.ingresos_mensuales, a.gastos_mensuales, a.score_crediticio FROM solicitudes s JOIN usuarios u ON s.usuario_id = u.id LEFT JOIN asociados a ON a.usuario_id = u.id ORDER BY s.id DESC")->fetchAll();
                     ?>
                     <div class="max-w-4xl mx-auto space-y-6">
                         <div>
@@ -706,6 +927,7 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                                 <?php if($s['estado'] === 'Pendiente'): ?>
                                     <form method="POST" class="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end pt-2">
                                         <input type="hidden" name="operacion" value="evaluar_solicitud">
+                                        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                                         <input type="hidden" name="solicitud_id" value="<?= $s['id'] ?>">
                                         <div class="sm:col-span-8">
                                             <input type="text" name="observaciones" required placeholder="Añadir observaciones de aprobación o rechazo..." class="w-full p-2.5 bg-slate-50 border rounded-xl text-xs">
@@ -734,6 +956,7 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
 
                         <form method="POST" class="space-y-4 text-xs">
                             <input type="hidden" name="operacion" value="procesar_pago">
+                            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                             <div>
                                 <label class="block text-slate-500 font-medium mb-1">Seleccionar Cuenta de Destino</label>
                                 <select name="prestamo_id" class="w-full p-3 bg-slate-50 border rounded-xl font-mono font-bold text-slate-800">
@@ -780,15 +1003,18 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                                     </div>
 
                                     <div class="bg-slate-900 p-2 rounded-xl text-[10px] text-slate-400 space-y-1">
+                                        <p class="truncate"><strong>NÚMERO DTE:</strong> <?= htmlspecialchars($d['numero_dte']) ?></p>
                                         <p class="truncate"><strong>SELLO:</strong> <?= $d['sello_recepcion'] ?></p>
                                         <p><strong>IVA (13% s/Int):</strong> $<?= number_format($d['iva'], 2) ?></p>
                                     </div>
 
                                     <div class="flex gap-2 justify-end relative z-20">
+                                        <a href="?sec=dte_historial&download_dte=<?= $d['id'] ?>" class="bg-slate-800 text-white px-3 py-1.5 rounded-lg text-[10px]">Descargar DTE</a>
                                         <button onclick="alert('Imprimiendo copia fiel en formato PDF...\n<?= $d['sello_recepcion'] ?>');" class="bg-slate-800 text-white px-3 py-1.5 rounded-lg text-[10px]">Reimprimir PDF</button>
                                         <?php if($d['estado_dte'] !== 'Anulado'): ?>
                                             <form method="POST" class="inline">
                                                 <input type="hidden" name="operacion" value="anular_dte">
+                                                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
                                                 <input type="hidden" name="dte_id" value="<?= $d['id'] ?>">
                                                 <button class="bg-rose-950 text-rose-400 border border-rose-800 px-3 py-1.5 rounded-lg text-[10px]">Anular DTE</button>
                                             </form>
@@ -882,16 +1108,17 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                     <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 max-w-6xl mx-auto">
                         <div class="lg:col-span-5 bg-white p-6 rounded-2xl border shadow-sm space-y-4">
                             <h3 class="text-sm font-bold text-slate-800">Estructurar Solicitud Oficial</h3>
-                            <form method="POST" enctype="multipart/form-data" class="space-y-4 text-xs">
+                            <form method="POST" enctype="multipart/form-data" class="space-y-4 text-xs" id="simulador-form">
                                 <input type="hidden" name="operacion" value="crear_solicitud">
-                                <div><label class="block text-slate-500 font-medium mb-1">Monto Líquido a Solicitar ($)</label><input type="number" name="monto" value="<?= $s_monto ?>" class="w-full p-2.5 bg-slate-50 border rounded-xl font-mono font-bold text-slate-800"></div>
-                                <div><label class="block text-slate-500 font-medium mb-1">Plazo</label><select name="plazo" class="w-full p-2.5 bg-slate-50 border rounded-xl font-bold"><option value="12" <?= $s_plazo==12?'selected':'' ?>>12 Meses</option><option value="24" <?= $s_plazo==24?'selected':'' ?>>24 Meses</option><option value="36" <?= $s_plazo==36?'selected':'' ?>>36 Meses</option></select></div>
+                                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                                <div><label class="block text-slate-500 font-medium mb-1">Monto Líquido a Solicitar ($)</label><input id="sim-monto" type="number" name="monto" value="<?= $s_monto ?>" class="w-full p-2.5 bg-slate-50 border rounded-xl font-mono font-bold text-slate-800"></div>
+                                <div><label class="block text-slate-500 font-medium mb-1">Plazo</label><select id="sim-plazo" name="plazo" class="w-full p-2.5 bg-slate-50 border rounded-xl font-bold"><option value="12" <?= $s_plazo==12?'selected':'' ?>>12 Meses</option><option value="24" <?= $s_plazo==24?'selected':'' ?>>24 Meses</option><option value="36" <?= $s_plazo==36?'selected':'' ?>>36 Meses</option></select></div>
                                 <div><label class="block text-slate-500 font-medium mb-1">Comprobantes de Ingresos (PDF/Imagen)</label><input type="file" name="documento" class="w-full p-2 bg-slate-50 border border-dashed rounded-xl"></div>
                                 <div class="bg-cyan-950 p-4 rounded-xl text-cyan-300 font-mono text-[11px]">
-                                    <p>Tasa Base: 12.00 % Anual | Cuota Fija: $<?= number_format($cuota_fija, 2) ?>/mes</p>
+                                    <p>Tasa Base: 12.00 % Anual | Cuota Fija: $<span id="sim-cuota"><?= number_format($cuota_fija, 2) ?></span>/mes</p>
                                 </div>
                                 <div class="flex gap-2">
-                                    <button type="submit" formaction="?sec=asoc_simulador" class="flex-1 bg-slate-200 text-slate-700 font-bold py-3 rounded-xl">Simular</button>
+                                    <button type="button" id="btn-simular" class="flex-1 bg-slate-200 text-slate-700 font-bold py-3 rounded-xl">Simular</button>
                                     <button type="submit" class="flex-1 bg-slate-900 text-white font-bold py-3 rounded-xl shadow-md">Enviar</button>
                                 </div>
                             </form>
@@ -899,9 +1126,9 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
 
                         <div class="lg:col-span-7 bg-white p-6 rounded-2xl border shadow-sm space-y-4">
                             <h3 class="text-xs font-bold text-slate-400 uppercase tracking-wider">Amortización Progresiva (Sistema Francés)</h3>
-                            <div class="max-h-80 overflow-y-auto border rounded-xl">
+                            <div class="max-h-80 overflow-y-auto border rounded-xl" id="sim-tabla-container">
                                 <table class="w-full text-left text-[11px] font-mono">
-                                    <tbody class="divide-y text-slate-700">
+                                    <tbody id="sim-tabla-body" class="divide-y text-slate-700">
                                         <?php foreach($tabla_sim as $ts): ?>
                                             <tr>
                                                 <td class="p-2 text-center bg-slate-50">Mes <?= $ts['mes'] ?></td>
@@ -916,6 +1143,60 @@ $sec = $_GET['sec'] ?? ($rol_sesion === 'Analista' ? 'kpis' : 'asoc_cuenta');
                             </div>
                         </div>
                     </div>
+                    <script>
+                        document.addEventListener('DOMContentLoaded', function() {
+                            const montoInput = document.getElementById('sim-monto');
+                            const plazoInput = document.getElementById('sim-plazo');
+                            const cuotaDisplay = document.getElementById('sim-cuota');
+                            const tablaBody = document.getElementById('sim-tabla-body');
+                            const botonSimular = document.getElementById('btn-simular');
+
+                            function calcularAmortizacion(monto, meses, tasaAnual) {
+                                const tasaMensual = tasaAnual / 12;
+                                if (meses <= 0 || monto <= 0 || tasaMensual === 0) return [];
+                                const cuota = monto * (tasaMensual * Math.pow(1 + tasaMensual, meses)) / (Math.pow(1 + tasaMensual, meses) - 1);
+                                let saldo = monto;
+                                const rows = [];
+                                for (let i = 1; i <= meses; i++) {
+                                    const interes = saldo * tasaMensual;
+                                    const capital = cuota - interes;
+                                    saldo = Math.max(0, saldo - capital);
+                                    rows.push({
+                                        mes: i,
+                                        cuota: cuota,
+                                        interes: interes,
+                                        capital: capital,
+                                        saldo: saldo
+                                    });
+                                }
+                                return rows;
+                            }
+
+                            function renderSimulacion() {
+                                const monto = parseFloat(montoInput.value) || 0;
+                                const plazo = parseInt(plazoInput.value, 10) || 0;
+                                const tabla = calcularAmortizacion(monto, plazo, 0.12);
+                                cuotaDisplay.textContent = tabla.length ? tabla[0].cuota.toFixed(2) : '0.00';
+                                tablaBody.innerHTML = tabla.map(row => `
+                                    <tr>
+                                        <td class="p-2 text-center bg-slate-50">Mes ${row.mes}</td>
+                                        <td class="p-2 font-bold">$${row.cuota.toFixed(2)}</td>
+                                        <td class="p-2 text-rose-600">-$${row.interes.toFixed(2)}</td>
+                                        <td class="p-2 text-emerald-600">+$${row.capital.toFixed(2)}</td>
+                                        <td class="p-2 text-slate-400">$${row.saldo.toFixed(2)}</td>
+                                    </tr>
+                                `).join('');
+                            }
+
+                            botonSimular.addEventListener('click', function(event) {
+                                event.preventDefault();
+                                renderSimulacion();
+                            });
+
+                            montoInput.addEventListener('input', renderSimulacion);
+                            plazoInput.addEventListener('change', renderSimulacion);
+                        });
+                    </script>
                 <?php endif; ?>
 
             </div>
